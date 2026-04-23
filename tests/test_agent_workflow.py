@@ -38,6 +38,24 @@ def test_offline_mode_proposes_logging_fix_for_print():
     assert "logging.info(" in fixed
 
 
+def test_heuristic_fix_does_not_rewrite_print_inside_docstring():
+    """
+    Guardrail: blind str.replace would rewrite the literal `print()` inside a
+    docstring (silently mutating documentation and triggering autofix=True on a
+    non-issue). The tokenize-based rewrite should leave string content alone.
+    """
+    agent = BugHoundAgent(client=None)
+    code = 'def f():\n    """Use print() responsibly."""\n    return 1\n'
+    result = agent.run(code)
+    fixed = result["fixed_code"]
+
+    # The docstring text must be preserved verbatim.
+    assert 'print()' in fixed, "docstring containing print() should not be rewritten"
+    assert 'logging.info()' not in fixed, "should not inject a logging call from docstring text"
+    # And we should not have added an `import logging` for a non-existent call site.
+    assert 'import logging' not in fixed, "should not add import logging when no real print call exists"
+
+
 def test_mock_client_forces_llm_fallback_to_heuristics_for_analysis():
     # MockClient returns non-JSON for analyzer prompts, so agent should fall back.
     # Use a HIGH-severity snippet so the new routing actually escalates to the LLM

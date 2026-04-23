@@ -1,4 +1,7 @@
+import re
 from typing import Dict, List
+
+_DEF_RE = re.compile(r"^\s*(?:async\s+)?def\s+(\w+)\s*\(", re.MULTILINE)
 
 
 def assess_risk(
@@ -61,6 +64,15 @@ def assess_risk(
         # This is usually good, but still risky.
         score -= 5
         reasons.append("Bare except was modified, verify correctness.")
+
+    original_defs = set(_DEF_RE.findall(original_code))
+    fixed_defs = set(_DEF_RE.findall(fixed_code))
+    if original_defs != fixed_defs:
+        score -= 30
+        reasons.append(
+            f"Function definitions changed ({sorted(original_defs)} -> {sorted(fixed_defs)}). "
+            "Fix may have renamed, added, or removed a function — verify behavior."
+        )
 
     # ----------------------------
     # Clamp score

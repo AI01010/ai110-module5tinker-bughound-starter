@@ -1,8 +1,20 @@
+import ast
+import io
 import json
 import re
+import tokenize
 from typing import Any, Dict, List, Optional
 
 from reliability.risk_assessor import assess_risk
+
+_BUILTIN_NAMES = {
+    "list", "dict", "set", "tuple", "str", "int", "float", "bool",
+    "id", "type", "input", "len", "min", "max", "sum", "map", "filter",
+    "open", "range", "object", "format", "vars",
+}
+
+_REQUESTS_METHODS = {"get", "post", "put", "delete", "patch", "head", "options", "request"}
+_SUBPROCESS_FUNCS = {"run", "call", "check_call", "check_output", "Popen"}
 
 
 class BugHoundAgent:
@@ -199,6 +211,11 @@ class BugHoundAgent:
     # Heuristic analyzer/fixer
     # ----------------------------
     def _heuristic_analyze(self, code: str) -> List[Dict[str, str]]:
+        issues = self._regex_analyze(code)
+        ast_issues = self._ast_analyze(code)
+        return self._merge_issues(issues, ast_issues)
+
+    def _regex_analyze(self, code: str) -> List[Dict[str, str]]:
         issues: List[Dict[str, str]] = []
 
         if "print(" in code:
@@ -292,6 +309,77 @@ class BugHoundAgent:
 
         return issues
 
+    def _ast_analyze(self, code: str) -> List[Dict[str, str]]:
+        """AST-based pass. Returns [] on SyntaxError so it never breaks the run."""
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return []
+
+        issues: List[Dict[str, str]] = []
+        seen_keys: set = set()
+
+        def add(issue_type: str, severity: str, msg: str) -> None:
+            key = (issue_type, msg)
+            if key in seen_keys:
+                return
+            seen_keys.add(key)
+            issues.append({"type": issue_type, "severity": severity, "msg": msg})
+
+        for node in ast.walk(tree):
+            # Mutable default args — precise version of the regex rule.
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for default in node.args.defaults + node.args.kw_defaults:
+                    if isinstance(default, (ast.List, ast.Dict, ast.Set)):
+                        add(
+                            "Reliability",
+                            "High",
+                            f"Mutable default argument in `{node.name}` — defaults are shared across calls. Use `None` and assign inside.",
+                        )
+                        break
+
+            # requests.get/post/... without timeout= kwarg
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                attr = node.func.attr
+                val = node.func.value
+                if (
+                    attr in _REQUESTS_METHODS
+                    and isinstance(val, ast.Name)
+                    and val.id == "requests"
+                ):
+                    if not any(kw.arg == "timeout" for kw in node.keywords):
+                        add(
+                            "Reliability",
+                            "High",
+                            f"`requests.{attr}(...)` call has no `timeout=` — can hang indefinitely on a slow server.",
+                        )
+
+                # subprocess.* with shell=True
+                if (
+                    attr in _SUBPROCESS_FUNCS
+                    and isinstance(val, ast.Name)
+                    and val.id == "subprocess"
+                ):
+                    for kw in node.keywords:
+                        if kw.arg == "shell" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
+                            add(
+                                "Security",
+                                "High",
+                                f"`subprocess.{attr}(..., shell=True)` — risk of shell injection if any arg is user-controlled.",
+                            )
+
+            # Shadowing builtins at module or function scope (simple assignment targets).
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id in _BUILTIN_NAMES:
+                        add(
+                            "Code Quality",
+                            "Medium",
+                            f"Variable `{target.id}` shadows a Python builtin — rename to avoid confusion and subtle bugs.",
+                        )
+
+        return issues
+
     def _heuristic_fix(self, code: str, issues: List[Dict[str, str]]) -> str:
         fixed = code
         types = {i.get("type") for i in issues}
@@ -305,9 +393,12 @@ class BugHoundAgent:
             )
 
         if "Code Quality" in types and "print(" in fixed:
-            if "import logging" not in fixed:
-                fixed = "import logging\n\n" + fixed
-            fixed = fixed.replace("print(", "logging.info(")
+            rewritten, changed = self._rewrite_print_calls(fixed)
+            if changed:
+                if "import logging" not in rewritten:
+                    rewritten = "import logging\n\n" + rewritten
+                fixed = rewritten
+            # else: every `print(` was inside a string or comment — leave the file alone.
 
         # `== None` / `!= None` -> `is None` / `is not None`
         if "None" in messages:
@@ -399,6 +490,38 @@ class BugHoundAgent:
                 if depth == 0:
                     return s[start : i + 1]
         return None
+
+    def _rewrite_print_calls(self, code: str) -> tuple:
+        """
+        Replace `print(` with `logging.info(` only at real call sites.
+
+        Uses tokenize so occurrences inside strings, docstrings, or comments
+        are left untouched. Returns (new_code, changed_flag).
+        """
+        try:
+            tokens = list(tokenize.generate_tokens(io.StringIO(code).readline))
+        except (tokenize.TokenizeError, IndentationError, SyntaxError):
+            # If the snippet doesn't tokenize cleanly, refuse to rewrite — the
+            # blind str.replace path was the bug we're fixing.
+            return code, False
+
+        targets = []
+        for i, tok in enumerate(tokens):
+            if tok.type == tokenize.NAME and tok.string == "print":
+                nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+                if nxt and nxt.type == tokenize.OP and nxt.string == "(":
+                    targets.append(tok)
+
+        if not targets:
+            return code, False
+
+        lines = code.splitlines(keepends=True)
+        for tok in reversed(targets):
+            row, col = tok.start  # row is 1-indexed
+            line = lines[row - 1]
+            lines[row - 1] = line[:col] + "logging.info" + line[col + len("print"):]
+
+        return "".join(lines), True
 
     def _strip_code_fences(self, text: str) -> str:
         text = text.strip()
