@@ -40,10 +40,12 @@ def test_offline_mode_proposes_logging_fix_for_print():
 
 def test_mock_client_forces_llm_fallback_to_heuristics_for_analysis():
     # MockClient returns non-JSON for analyzer prompts, so agent should fall back.
+    # Use a HIGH-severity snippet so the new routing actually escalates to the LLM
+    # (low/medium issues short-circuit and skip the LLM to save quota).
     agent = BugHoundAgent(client=MockClient())
-    code = "def f():\n    print('hi')\n    return True\n"
+    code = "def f():\n    try:\n        return 1\n    except:\n        return 0\n"
     result = agent.run(code)
 
-    assert any(issue.get("type") == "Code Quality" for issue in result["issues"])
+    assert any(issue.get("type") == "Reliability" for issue in result["issues"])
     # Ensure we logged the fallback path
     assert any("Falling back to heuristics" in entry.get("message", "") for entry in result["logs"])
